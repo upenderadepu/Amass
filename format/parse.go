@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package format
 
@@ -10,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	amassnet "github.com/OWASP/Amass/v3/net"
+	amassnet "github.com/owasp-amass/amass/v4/net"
 )
 
 // ParseStrings implements the flag.Value interface.
@@ -65,7 +66,7 @@ func (p *ParseInts) String() string {
 // Set implements the flag.Value interface.
 func (p *ParseInts) Set(s string) error {
 	if s == "" {
-		return fmt.Errorf("Integer parsing failed")
+		return fmt.Errorf("integer parsing failed")
 	}
 
 	nums := strings.Split(s, ",")
@@ -167,7 +168,7 @@ func (p *ParseCIDRs) Set(s string) error {
 	for _, cidr := range cidrs {
 		_, ipnet, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return fmt.Errorf("Failed to parse %s as a CIDR", cidr)
+			return fmt.Errorf("failed to parse %s as a CIDR", cidr)
 		}
 
 		*p = append(*p, ipnet)

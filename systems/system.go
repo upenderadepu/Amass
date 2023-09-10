@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package systems
 
@@ -7,12 +8,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/requests"
-	eb "github.com/caffix/eventbus"
 	"github.com/caffix/netmap"
-	"github.com/caffix/resolve"
 	"github.com/caffix/service"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/config/config"
+	"github.com/owasp-amass/resolve"
 )
 
 // System is the object type for managing services that perform various reconnaissance activities.
@@ -20,8 +20,11 @@ type System interface {
 	// Returns the configuration for the enumeration this service supports
 	Config() *config.Config
 
-	// Returns the resolver pool that handles DNS requests
-	Pool() resolve.Resolver
+	// Returns the pool that handles queries using untrusted DNS resolvers
+	Resolvers() *resolve.Resolvers
+
+	// Returns the pool that handles queries using trusted DNS resolvers
+	TrustedResolvers() *resolve.Resolvers
 
 	// Returns the cache populated by the system
 	Cache() *requests.ASNCache
@@ -36,7 +39,7 @@ type System interface {
 	DataSources() []service.Service
 
 	// SetDataSources assigns the data sources that will be used by System
-	SetDataSources(sources []service.Service)
+	SetDataSources(sources []service.Service) error
 
 	// GraphDatabases return the Graphs used by the System
 	GraphDatabases() []*netmap.Graph
@@ -50,26 +53,17 @@ type System interface {
 
 // PopulateCache updates the provided System cache with ASN information from the System data sources.
 func PopulateCache(ctx context.Context, asn int, sys System) {
-	bus := eb.NewEventBus()
-	defer bus.Stop()
-
-	cache := sys.Cache()
-	bus.Subscribe(requests.NewASNTopic, cache.Update)
-	defer bus.Unsubscribe(requests.NewASNTopic, cache.Update)
-
-	ctx = context.WithValue(ctx, requests.ContextConfig, sys.Config())
-	ctx = context.WithValue(ctx, requests.ContextEventBus, bus)
-
 	// Send the ASN requests to the data sources
 	for _, src := range sys.DataSources() {
-		src.Request(ctx, &requests.ASNRequest{ASN: asn})
-	}
-
-	// Wait for the ASN requests to return responses
-	t := time.NewTimer(10 * time.Second)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
+		src.Input() <- &requests.ASNRequest{ASN: asn}
+		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+		case req := <-src.Output():
+			if a, ok := req.(*requests.ASNRequest); ok {
+				sys.Cache().Update(a)
+			}
+		default:
+		}
 	}
 }

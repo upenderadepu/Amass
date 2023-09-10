@@ -1,5 +1,6 @@
-// Copyright 2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package scripting
 
@@ -10,7 +11,7 @@ import (
 	"net"
 	"strconv"
 
-	amassnet "github.com/OWASP/Amass/v3/net"
+	amassnet "github.com/owasp-amass/amass/v4/net"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -128,12 +129,9 @@ func connectSend(L *lua.LState) int {
 }
 
 func connectClose(L *lua.LState) int {
-	s, err := extractSocket(L.CheckUserData(1))
-	if err != nil {
-		return 0
+	if s, err := extractSocket(L.CheckUserData(1)); err == nil {
+		s.Conn.Close()
 	}
-
-	s.Conn.Close()
 	return 0
 }
 
@@ -151,6 +149,5 @@ func extractSocket(udata *lua.LUserData) (*socketWrapper, error) {
 	if !ok {
 		return nil, errors.New("the user data was not a script sock wrapper")
 	}
-
 	return wrapper, nil
 }

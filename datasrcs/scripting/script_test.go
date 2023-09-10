@@ -1,39 +1,41 @@
-// Copyright 2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package scripting
 
 import (
-	"context"
-
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/requests"
-	"github.com/OWASP/Amass/v3/systems"
-	"github.com/caffix/eventbus"
 	"github.com/caffix/netmap"
-	"github.com/caffix/resolve"
+	"github.com/caffix/service"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/amass/v4/systems"
+	"github.com/owasp-amass/config/config"
+	"github.com/owasp-amass/resolve"
 )
 
-func setupMockScriptEnv(script string) (context.Context, systems.System) {
-	cfg := config.NewConfig()
-	sys := newMockSystem(cfg)
-
-	ctx := context.WithValue(context.Background(), requests.ContextConfig, cfg)
-	ctx = context.WithValue(ctx, requests.ContextEventBus, eventbus.NewEventBus())
+func setupMockScriptEnv(script string) (service.Service, systems.System) {
+	sys := newMockSystem(config.NewConfig())
 
 	if s := NewScript(script, sys); s != nil {
 		if err := sys.AddAndStart(s); err == nil {
-			return ctx, sys
+			return s, sys
 		}
 	}
 	return nil, nil
 }
 
 func newMockSystem(cfg *config.Config) systems.System {
-	return &systems.SimpleSystem{
+	ss := &systems.SimpleSystem{
 		Cfg:      cfg,
-		Resolver: resolve.NewBaseResolver("8.8.8.8", 50, cfg.Log),
-		Graph:    netmap.NewGraph(netmap.NewCayleyGraphMemory()),
+		Pool:     resolve.NewResolvers(),
+		Trusted:  resolve.NewResolvers(),
+		Graph:    netmap.NewGraph("memory", "", ""),
 		ASNCache: requests.NewASNCache(),
 	}
+
+	ss.Pool.SetLogger(cfg.Log)
+	_ = ss.Pool.AddResolvers(20, "8.8.8.8")
+	ss.Trusted.SetLogger(cfg.Log)
+	_ = ss.Trusted.AddResolvers(20, "8.8.8.8")
+	return ss
 }

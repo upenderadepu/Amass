@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package http
 
@@ -10,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -22,12 +22,13 @@ import (
 	"sync"
 	"time"
 
-	amassnet "github.com/OWASP/Amass/v3/net"
-	"github.com/OWASP/Amass/v3/net/dns"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/caffix/stringset"
 	"github.com/geziyor/geziyor"
 	"github.com/geziyor/geziyor/client"
+	amassnet "github.com/owasp-amass/amass/v4/net"
+	"github.com/owasp-amass/amass/v4/net/dns"
+	bf "github.com/tylertreat/BoomFilters"
 )
 
 const (
@@ -35,22 +36,47 @@ const (
 	Accept = "text/html,application/json,application/xhtml+xml,application/xml;q=0.5,*/*;q=0.2"
 	// AcceptLang is the default HTTP Accept-Language header value used by Amass.
 	AcceptLang       = "en-US,en;q=0.5"
-	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.45 Safari/537.36"
-	windowsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.45 Safari/537.36"
-	darwinUserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_0_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.45 Safari/537.36"
-	httpTimeout      = 60 * time.Second
-	handshakeTimeout = 20 * time.Second
+	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+	windowsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+	darwinUserAgent  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+	httpTimeout      = 10 * time.Second
+	handshakeTimeout = 5 * time.Second
 )
 
 var (
 	// UserAgent is the default user agent used by Amass during HTTP requests.
 	UserAgent   string
 	subRE       = dns.AnySubdomainRegex()
-	nameStripRE = regexp.MustCompile(`^u[0-9a-f]{4}|20|22|25|27|2b|2f|3d|3a|40`)
+	nameStripRE = regexp.MustCompile(`^(u[0-9a-f]{4}|20|22|25|27|2b|2f|3d|3a|40)`)
 )
 
 // DefaultClient is the same HTTP client used by the package methods.
 var DefaultClient *http.Client
+
+// Header represents the HTTP headers for requests and responses.
+type Header map[string]string
+
+// Request represents the HTTP request in the Amass preferred format.
+type Request struct {
+	URL    string
+	Method string
+	Header Header
+	Body   string
+	Auth   *BasicAuth
+}
+
+// Response represents the HTTP response in the Amass preferred format.
+type Response struct {
+	Status     string
+	StatusCode int
+	Proto      string
+	ProtoMajor int
+	ProtoMinor int
+	Header     Header
+	Body       string
+	Length     int64
+	TLS        *tls.ConnectionState
+}
 
 // BasicAuth contains the data used for HTTP basic authentication.
 type BasicAuth struct {
@@ -67,7 +93,7 @@ func init() {
 			DialContext:           amassnet.DialContext,
 			MaxIdleConns:          200,
 			MaxConnsPerHost:       50,
-			IdleConnTimeout:       90 * time.Second,
+			IdleConnTimeout:       10 * time.Second,
 			TLSHandshakeTimeout:   handshakeTimeout,
 			ExpectContinueTimeout: 5 * time.Second,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
@@ -82,6 +108,67 @@ func init() {
 		UserAgent = darwinUserAgent
 	default:
 		UserAgent = defaultUserAgent
+	}
+}
+
+// HdrToAmassHeader converts a net/http Header to an Amass Header.
+func HdrToAmassHeader(hdr http.Header) Header {
+	h := make(Header)
+	for k, v := range hdr {
+		if len(v) > 0 {
+			h[k] = strings.Join(v, ", ")
+		}
+	}
+	return h
+}
+
+// ReqToAmassRequest converts a net/http Request to an Amass Request.
+func ReqToAmassRequest(req *http.Request) *Request {
+	var body string
+	if req.Body != nil {
+		if b, err := io.ReadAll(req.Body); err == nil {
+			body = string(b)
+		}
+		_ = req.Body.Close()
+	}
+
+	var ba *BasicAuth
+	if user, pass, ok := req.BasicAuth(); ok {
+		ba = &BasicAuth{
+			Username: user,
+			Password: pass,
+		}
+	}
+
+	return &Request{
+		URL:    req.URL.String(),
+		Method: req.Method,
+		Header: HdrToAmassHeader(req.Header),
+		Body:   body,
+		Auth:   ba,
+	}
+}
+
+// RespToAmassResponse converts a net/http Response to an Amass Response.
+func RespToAmassResponse(resp *http.Response) *Response {
+	var body string
+	if resp.Body != nil {
+		if b, err := io.ReadAll(resp.Body); err == nil {
+			body = string(b)
+		}
+		_ = resp.Body.Close()
+	}
+
+	return &Response{
+		Status:     resp.Status,
+		StatusCode: resp.StatusCode,
+		Proto:      resp.Proto,
+		ProtoMajor: resp.ProtoMajor,
+		ProtoMinor: resp.ProtoMinor,
+		Header:     HdrToAmassHeader(resp.Header),
+		Body:       body,
+		Length:     resp.ContentLength,
+		TLS:        resp.TLS,
 	}
 }
 
@@ -107,143 +194,128 @@ func CheckCookie(urlString string, cookieName string) bool {
 	return found
 }
 
-// RequestWebPage returns a string containing the entire response for the provided URL when successful.
-func RequestWebPage(ctx context.Context, u string, body io.Reader, hvals map[string]string, auth *BasicAuth) (string, error) {
-	method := "GET"
-	if body != nil {
-		method = "POST"
+// RequestWebPage returns the response headers, body, and status code for the provided URL when successful.
+func RequestWebPage(ctx context.Context, r *Request) (*Response, error) {
+	if r == nil {
+		return nil, errors.New("failed to provide a valid Amass HTTP request")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if r.Method == "" {
+		r.Method = "GET"
+	} else if r.Method != "GET" && r.Method != "POST" {
+		return nil, errors.New("failed to provide a valid HTTP method")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, r.Method, r.URL, strings.NewReader(r.Body))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Close = true
 
-	if auth != nil && auth.Username != "" && auth.Password != "" {
-		req.SetBasicAuth(auth.Username, auth.Password)
+	if r.Auth != nil && r.Auth.Username != "" && r.Auth.Password != "" {
+		req.SetBasicAuth(r.Auth.Username, r.Auth.Password)
 	}
 
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Accept", Accept)
 	req.Header.Set("Accept-Language", AcceptLang)
-	for k, v := range hvals {
+	for k, v := range r.Header {
 		req.Header.Set(k, v)
 	}
 
-	var in string
 	resp, err := DefaultClient.Do(req)
-	if err == nil {
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			err = fmt.Errorf("%d: %s", resp.StatusCode, resp.Status)
-		}
-		if b, err := ioutil.ReadAll(resp.Body); err == nil {
-			in = string(b)
-		}
+	if err != nil {
+		return nil, err
 	}
-	return in, err
+	return RespToAmassResponse(resp), nil
 }
 
-// Crawl will spider the web page at the URL argument looking for DNS names within the scope provided.
-func Crawl(ctx context.Context, u string, scope []string, max int, f *stringset.Set) ([]string, error) {
+// Crawl will spider the web page at the URL argument looking while staying within the scope provided.
+func Crawl(ctx context.Context, u string, scope []string, max int, callback func(*Request, *Response)) error {
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("the context expired")
+		return fmt.Errorf("the context expired")
 	default:
 	}
 
-	if f == nil {
-		f = stringset.New()
-		defer f.Close()
-	}
-
-	results := stringset.New()
-	defer results.Close()
-
-	g := createCrawler(u, scope, max, results, f)
-	g.Client = client.NewClient(&client.Options{
-		MaxBodySize:    50 * 1024 * 1024, // 50MB
-		RetryTimes:     2,
-		RetryHTTPCodes: []int{408, 500, 502, 503, 504, 522, 524},
-	})
-	g.Client.Client = http.DefaultClient
-
-	done := make(chan struct{}, 2)
-	go func() {
-		g.Start()
-		close(done)
-	}()
-
-	var err error
-	select {
-	case <-ctx.Done():
-		err = fmt.Errorf("the context expired during the crawl of %s", u)
-	case <-done:
-		if len(results.Slice()) == 0 {
-			err = fmt.Errorf("no DNS names were discovered during the crawl of %s", u)
-		}
-	}
-
-	return results.Slice(), err
-}
-
-func createCrawler(u string, scope []string, max int, results, filter *stringset.Set) *geziyor.Geziyor {
 	var count int
 	var m sync.Mutex
+	filter := bf.NewDefaultStableBloomFilter(10000, 0.01)
+	defer filter.Reset()
+	attrs := []string{"action", "cite", "data", "formaction",
+		"href", "longdesc", "poster", "src", "srcset", "xmlns"}
+	tags := []string{"a", "area", "audio", "base", "blockquote", "button",
+		"embed", "form", "frame", "frameset", "html", "iframe", "img", "input",
+		"ins", "link", "noframes", "object", "q", "script", "source", "track", "video"}
 
-	return geziyor.NewGeziyor(&geziyor.Options{
+	g := geziyor.NewGeziyor(&geziyor.Options{
 		StartURLs:             []string{u},
-		Timeout:               5 * time.Minute,
 		RobotsTxtDisabled:     true,
 		UserAgent:             UserAgent,
 		LogDisabled:           true,
 		ConcurrentRequests:    5,
-		RequestDelay:          750 * time.Millisecond,
+		RequestDelay:          50 * time.Millisecond,
 		RequestDelayRandomize: true,
 		ParseFunc: func(g *geziyor.Geziyor, r *client.Response) {
-			process := func(n string) {
-				if u, err := r.Request.URL.Parse(n); err == nil {
-					host := u.Hostname()
-					if host != "" {
-						results.Insert(host)
-					}
-					if whichDomain(host, scope) == "" {
-						return
-					}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
-					if s := u.String(); s != "" && !filter.Has(s) {
-						// Be sure the crawl has not exceeded the maximum links to be followed
-						m.Lock()
-						count++
-						if max <= 0 || count < max {
-							filter.Insert(s)
-							g.Get(s, g.Opt.ParseFunc)
-						}
-						m.Unlock()
+			process := func(n string) {
+				u, err := r.Request.URL.Parse(n)
+				if err != nil {
+					return
+				}
+				if host := u.Hostname(); host == "" || whichDomain(host, scope) == "" {
+					return
+				}
+
+				m.Lock()
+				if s := u.String(); s != "" && !filter.Test([]byte(s)) {
+					count++
+					// Be sure the crawl has not exceeded the maximum links to be followed
+					if max <= 0 || count < max {
+						filter.Add([]byte(s))
+						g.Get(s, g.Opt.ParseFunc)
 					}
 				}
+				m.Unlock()
 			}
 			tag := func(i int, s *goquery.Selection) {
-				// TODO: add the 'srcset' attr
-				attrs := []string{"action", "cite", "data", "formaction",
-					"href", "longdesc", "poster", "src", "srcset", "xmlns"}
 				for _, attr := range attrs {
 					if name, ok := s.Attr(attr); ok {
 						process(name)
 					}
 				}
 			}
-
-			tagname := []string{"a", "area", "audio", "base", "blockquote", "button",
-				"embed", "form", "frame", "frameset", "html", "iframe", "img", "input",
-				"ins", "link", "noframes", "object", "q", "script", "source", "track", "video"}
-			for _, t := range tagname {
+			for _, t := range tags {
 				r.HTMLDoc.Find(t).Each(tag)
 			}
+
+			callback(ReqToAmassRequest(r.Request.Request), &Response{
+				Status:     r.Status,
+				StatusCode: r.StatusCode,
+				Proto:      r.Proto,
+				ProtoMajor: r.ProtoMajor,
+				ProtoMinor: r.ProtoMinor,
+				Header:     HdrToAmassHeader(r.Header),
+				Body:       string(r.Body),
+				Length:     r.ContentLength,
+				TLS:        r.TLS,
+			})
 		},
 	})
+	g.Client = client.NewClient(&client.Options{
+		MaxBodySize:    50 * 1024 * 1024, // 50MB
+		RetryTimes:     2,
+		RetryHTTPCodes: []int{408, 500, 502, 503, 504, 522, 524},
+	})
+	g.Client.Client = DefaultClient
+
+	g.Start()
+	return nil
 }
 
 func whichDomain(name string, scope []string) string {
@@ -265,13 +337,14 @@ func whichDomain(name string, scope []string) string {
 // PullCertificateNames attempts to pull a cert from one or more ports on an IP.
 func PullCertificateNames(ctx context.Context, addr string, ports []int) []string {
 	var names []string
-	// Check hosts for certificates that contain subdomain names
+	// check hosts for certificates that contain subdomain names
 	for _, port := range ports {
 		if c, err := TLSConn(ctx, addr, port); err == nil {
-			// Get the correct certificate in the chain
+			// get the correct certificate in the chain
 			certChain := c.ConnectionState().PeerCertificates
-			// Create the new requests from names found within the cert
-			names = append(names, namesFromCert(certChain[0])...)
+			// create the new requests from names found within the cert
+			names = append(names, NamesFromCert(certChain[0])...)
+			c.Close()
 		}
 
 		select {
@@ -283,38 +356,28 @@ func PullCertificateNames(ctx context.Context, addr string, ports []int) []strin
 	return names
 }
 
-// TLSConn attempts to make a TLS connection with the host on given port
+// TLSConn attempts to make a TLS connection with the host on the given port.
 func TLSConn(ctx context.Context, host string, port int) (*tls.Conn, error) {
-	// Set the maximum time allowed for making the connection
+	// set the maximum time allowed for making the connection
 	tCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
-	// Obtain the connection
+	// obtain the connection
 	conn, err := amassnet.DialContext(tCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 
 	c := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
-	// Attempt to acquire the certificate chain
-	errChan := make(chan error, 2)
-	go func() {
-		errChan <- c.Handshake()
-	}()
-
-	t := time.NewTimer(handshakeTimeout)
-	select {
-	case <-t.C:
-		err = errors.New("handshake timeout")
-	case e := <-errChan:
-		err = e
+	// attempt to acquire the certificate chain
+	if err := c.HandshakeContext(tCtx); err != nil {
+		c.Close()
+		return nil, err
 	}
-	t.Stop()
-
-	return c, err
+	return c, nil
 }
 
-func namesFromCert(cert *x509.Certificate) []string {
+// NamesFromCert parses DNS names out of a TLS certificate.
+func NamesFromCert(cert *x509.Certificate) []string {
 	var cn string
 
 	for _, name := range cert.Subject.Names {

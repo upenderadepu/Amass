@@ -1,5 +1,6 @@
--- Copyright 2021 Jeff Foley. All rights reserved.
+-- Copyright © by Jeff Foley 2021-2022. All rights reserved.
 -- Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+-- SPDX-License-Identifier: Apache-2.0
 
 local url = require("url")
 
@@ -14,7 +15,7 @@ function vertical(ctx, domain)
     local u = "https://dnsdumpster.com"
 
     local token = get_token(ctx, u)
-    if token == "" then
+    if (token == "") then
         return
     end
 
@@ -26,33 +27,31 @@ function vertical(ctx, domain)
 
     local params = {
         ['csrfmiddlewaretoken']=token,
-		['targetip']=domain,
+        ['targetip']=domain,
         ['user']="free"
     }
 
-    local resp, err = request(ctx, {
-        ['method']="POST",
-        ['data']=url.build_query_string(params),
+    scrape(ctx, {
         ['url']=u,
-        ['headers']=headers,
+        ['method']="POST",
+        ['header']=headers,
+        ['body']=url.build_query_string(params),
     })
-    if (err ~= nil and err ~= "") then
-        log(ctx, "vertical request to service failed: " .. err)
-        return
-    end
-
-    send_names(ctx, resp)
 end
 
 function get_token(ctx, u)
     local resp, err = request(ctx, {['url']=u})
     if (err ~= nil and err ~= "") then
-        log(ctx, "vertical request to service failed: " .. err)
+        log(ctx, "get_token request to service failed: " .. err)
+        return ""
+    elseif (resp.status_code < 200 or resp.status_code >= 400) then
+        log(ctx, "get_token request to service returned with status code: " .. resp.status)
         return ""
     end
 
-    local matches = submatch(resp, '<input type="hidden" name="csrfmiddlewaretoken" value="([a-zA-Z0-9]*)">')
+    local matches = submatch(resp.body, '<input type="hidden" name="csrfmiddlewaretoken" value="([a-zA-Z0-9]*)">')
     if (matches == nil or #matches == 0) then
+        log(ctx, "failed to discover the token in the response body")
         return ""
     end
 
@@ -60,6 +59,5 @@ function get_token(ctx, u)
     if (match == nil or #match ~= 2) then
         return ""
     end
-
     return match[2]
 end

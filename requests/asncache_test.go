@@ -1,5 +1,6 @@
-// Copyright 2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package requests
 
@@ -7,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestEmpty(t *testing.T) {
@@ -31,8 +34,6 @@ func TestUpdate(t *testing.T) {
 		Address: "72.237.4.113",
 		ASN:     26808,
 		Prefix:  "72.237.4.0/24",
-		Tag:     RIR,
-		Source:  "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.113"); entry == nil {
@@ -48,8 +49,6 @@ func TestUpdate(t *testing.T) {
 		AllocationDate: time.Now(),
 		Description:    "UTICA-COLLEGE",
 		Netblocks:      []string{"72.237.4.0/24", "8.24.68.0/23"},
-		Tag:            RIR,
-		Source:         "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.113"); entry == nil || entry.CC != "US" || entry.Description != "UTICA-COLLEGE" {
@@ -71,8 +70,6 @@ func TestASNSearch(t *testing.T) {
 		Address: "72.237.4.113",
 		ASN:     26808,
 		Prefix:  "72.237.4.0/24",
-		Tag:     RIR,
-		Source:  "RIR",
 	})
 
 	if entry := cache.ASNSearch(26808); entry == nil {
@@ -99,8 +96,6 @@ func TestAddrSearch(t *testing.T) {
 		AllocationDate: time.Now(),
 		Description:    "UTICA-COLLEGE",
 		Netblocks:      []string{"72.237.4.0/24", "8.24.68.0/23"},
-		Tag:            RIR,
-		Source:         "RIR",
 	})
 
 	if entry := cache.AddrSearch("72.237.4.120"); entry == nil {
@@ -116,4 +111,36 @@ func TestAddrSearch(t *testing.T) {
 	if _, ipnet, err := net.ParseCIDR(entry.Prefix); err != nil || !ipnet.Contains(ip) {
 		t.Errorf("AddrSearch returned the wrong Prefix value for the provided IP address: %s", entry.Prefix)
 	}
+}
+
+func TestIsReservedAddress(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		addr       string
+		isReserved bool
+	}{
+		{
+			name:       "Test Invalid IP",
+			addr:       "300.300.300.300",
+			isReserved: false,
+		},
+		{
+			name:       "Test Reserved Address",
+			addr:       "192.168.0.0",
+			isReserved: true,
+		},
+		{
+			name:       "Test Unreserved Address",
+			addr:       "202.145.4.15",
+			isReserved: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			isReserved, _ := isReservedAddress(test.addr)
+			require.Equal(t, isReserved, test.isReserved)
+		})
+	}
+
 }

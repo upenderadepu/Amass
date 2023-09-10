@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package requests
 
@@ -60,7 +61,7 @@ func (e *cacheRangerEntry) Network() net.IPNet {
 	return e.IPNet
 }
 
-// NewASNCache returns an empty ASNCache for saving and search ASN and netblock information.
+// NewASNCache returns an empty ASNCache for saving and searching ASN and netblock information.
 func NewASNCache() *ASNCache {
 	return &ASNCache{
 		cache:  make(map[int]*ASNRequest),
@@ -68,7 +69,7 @@ func NewASNCache() *ASNCache {
 	}
 }
 
-// Update uses the saves the information in ASNRequest into the ASNCache.
+// Update saves the information in ASNRequest into the ASNCache.
 func (c *ASNCache) Update(req *ASNRequest) {
 	c.Lock()
 	defer c.Unlock()
@@ -155,8 +156,6 @@ func (c *ASNCache) AddrSearch(addr string) *ASNRequest {
 			ASN:         0,
 			Prefix:      cidr,
 			Description: "Reserved Network Address Blocks",
-			Tag:         RIR,
-			Source:      "RIR",
 		}
 	}
 
@@ -182,8 +181,6 @@ func (c *ASNCache) AddrSearch(addr string) *ASNRequest {
 		Prefix:      prefix,
 		Netblocks:   netblocks.Slice(),
 		Description: entry.Data.Description,
-		Tag:         RIR,
-		Source:      "RIR",
 	}
 }
 

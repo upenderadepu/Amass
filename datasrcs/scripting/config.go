@@ -1,30 +1,23 @@
-// Copyright 2020-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package scripting
 
 import (
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/service"
+	"github.com/owasp-amass/amass/v4/format"
+	"github.com/owasp-amass/config/config"
 	lua "github.com/yuin/gopher-lua"
 )
 
 // Wrapper so that scripts can obtain the configuration for the current enumeration.
 func (s *Script) config(L *lua.LState) int {
-	ctx, err := extractContext(L.CheckUserData(1))
-	if err != nil {
-		L.Push(lua.LNil)
-		return 1
-	}
-
-	cfg, _, err := requests.ContextConfigBus(ctx)
-	if err != nil {
-		L.Push(lua.LNil)
-		return 1
-	}
+	cfg := s.sys.Config()
 
 	r := L.NewTable()
+	r.RawSetString("version", lua.LString(format.Version))
+
 	if cfg.Active {
 		r.RawSetString("mode", lua.LString("active"))
 	} else if cfg.Passive {
@@ -33,7 +26,6 @@ func (s *Script) config(L *lua.LState) int {
 		r.RawSetString("mode", lua.LString("normal"))
 	}
 
-	r.RawSetString("event_id", lua.LString(cfg.UUID.String()))
 	r.RawSetString("max_dns_queries", lua.LNumber(cfg.MaxDNSQueries))
 
 	scope := L.NewTable()
@@ -44,7 +36,7 @@ func (s *Script) config(L *lua.LState) int {
 	scope.RawSetString("domains", tb)
 
 	tb = L.NewTable()
-	for _, sub := range cfg.Blacklist {
+	for _, sub := range cfg.Scope.Blacklist {
 		tb.Append(lua.LString(sub))
 	}
 	scope.RawSetString("blacklist", tb)
@@ -68,25 +60,25 @@ func (s *Script) config(L *lua.LState) int {
 	r.RawSetString("provided_names", tb)
 
 	tb = L.NewTable()
-	for _, addr := range cfg.Addresses {
+	for _, addr := range cfg.Scope.Addresses {
 		tb.Append(lua.LString(addr.String()))
 	}
 	scope.RawSetString("addresses", tb)
 
 	tb = L.NewTable()
-	for _, cidr := range cfg.CIDRs {
+	for _, cidr := range cfg.Scope.CIDRs {
 		tb.Append(lua.LString(cidr.String()))
 	}
 	scope.RawSetString("cidrs", tb)
 
 	tb = L.NewTable()
-	for _, asn := range cfg.ASNs {
+	for _, asn := range cfg.Scope.ASNs {
 		tb.Append(lua.LNumber(asn))
 	}
 	scope.RawSetString("asns", tb)
 
 	tb = L.NewTable()
-	for _, port := range cfg.Ports {
+	for _, port := range cfg.Scope.Ports {
 		tb.Append(lua.LNumber(port))
 	}
 	scope.RawSetString("ports", tb)
@@ -113,6 +105,12 @@ func (s *Script) config(L *lua.LState) int {
 }
 
 func (s *Script) dataSourceConfig(L *lua.LState) int {
+	dsc := s.sys.Config().DataSrcConfigs
+	if dsc == nil {
+		L.Push(lua.LNil)
+		return 1
+	}
+
 	cfg := s.sys.Config().GetDataSourceConfig(s.String())
 	if cfg == nil {
 		L.Push(lua.LNil)
@@ -125,7 +123,7 @@ func (s *Script) dataSourceConfig(L *lua.LState) int {
 		tb.RawSetString("ttl", lua.LNumber(cfg.TTL))
 	}
 
-	if creds := cfg.GetCredentials(); creds != nil {
+	if creds := dsc.GetCredentials(cfg.Name); creds != nil {
 		c := L.NewTable()
 
 		c.RawSetString("name", lua.LString(creds.Name))
@@ -135,8 +133,8 @@ func (s *Script) dataSourceConfig(L *lua.LState) int {
 		if creds.Password != "" {
 			c.RawSetString("password", lua.LString(creds.Password))
 		}
-		if creds.Key != "" {
-			c.RawSetString("key", lua.LString(creds.Key))
+		if creds.Apikey != "" {
+			c.RawSetString("key", lua.LString(creds.Apikey))
 		}
 		if creds.Secret != "" {
 			c.RawSetString("secret", lua.LString(creds.Secret))
@@ -152,14 +150,11 @@ func (s *Script) dataSourceConfig(L *lua.LState) int {
 func (s *Script) inScope(L *lua.LState) int {
 	result := lua.LFalse
 
-	if ctx, err := extractContext(L.CheckUserData(1)); err == nil {
-		if cfg, _, err := requests.ContextConfigBus(ctx); err == nil {
-			if sub := L.CheckString(2); sub != "" && cfg.IsDomainInScope(sub) {
-				result = lua.LTrue
-			}
+	if _, err := extractContext(L.CheckUserData(1)); err == nil {
+		if sub := L.CheckString(2); sub != "" && s.sys.Config().IsDomainInScope(sub) {
+			result = lua.LTrue
 		}
 	}
-
 	L.Push(result)
 	return 1
 }
@@ -168,19 +163,13 @@ func (s *Script) inScope(L *lua.LState) int {
 func (s *Script) bruteWordlist(L *lua.LState) int {
 	tb := L.NewTable()
 
-	if ctx, err := extractContext(L.CheckUserData(1)); err == nil {
-		if cfg, _, err := requests.ContextConfigBus(ctx); err == nil {
-			for _, word := range cfg.Wordlist {
-				tb.Append(lua.LString(word))
-			}
+	if _, err := extractContext(L.CheckUserData(1)); err == nil {
+		for _, word := range s.sys.Config().Wordlist {
+			tb.Append(lua.LString(word))
 		}
 	}
 
-	if tb.Len() > 0 {
-		L.Push(tb)
-	} else {
-		L.Push(lua.LNil)
-	}
+	L.Push(tb)
 	return 1
 }
 
@@ -188,19 +177,13 @@ func (s *Script) bruteWordlist(L *lua.LState) int {
 func (s *Script) altWordlist(L *lua.LState) int {
 	tb := L.NewTable()
 
-	if ctx, err := extractContext(L.CheckUserData(1)); err == nil {
-		if cfg, _, err := requests.ContextConfigBus(ctx); err == nil {
-			for _, word := range cfg.AltWordlist {
-				tb.Append(lua.LString(word))
-			}
+	if _, err := extractContext(L.CheckUserData(1)); err == nil {
+		for _, word := range s.sys.Config().AltWordlist {
+			tb.Append(lua.LString(word))
 		}
 	}
 
-	if tb.Len() > 0 {
-		L.Push(tb)
-	} else {
-		L.Push(lua.LNil)
-	}
+	L.Push(tb)
 	return 1
 }
 
@@ -226,10 +209,8 @@ func (s *Script) checkRateLimit(L *lua.LState) int {
 func (s *Script) outputdir(L *lua.LState) int {
 	var dir string
 
-	if ctx, err := extractContext(L.CheckUserData(1)); err == nil {
-		if cfg, _, err := requests.ContextConfigBus(ctx); err == nil {
-			dir = config.OutputDirectory(cfg.Dir)
-		}
+	if _, err := extractContext(L.CheckUserData(1)); err == nil {
+		dir = config.OutputDirectory(s.sys.Config().Dir)
 	}
 
 	if dir != "" {

@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package main
 
@@ -10,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,13 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	"github.com/OWASP/Amass/v3/datasrcs"
-	"github.com/OWASP/Amass/v3/format"
-	"github.com/OWASP/Amass/v3/intel"
-	"github.com/OWASP/Amass/v3/systems"
 	"github.com/caffix/stringset"
 	"github.com/fatih/color"
+	"github.com/owasp-amass/amass/v4/datasrcs"
+	"github.com/owasp-amass/amass/v4/format"
+	"github.com/owasp-amass/amass/v4/intel"
+	"github.com/owasp-amass/amass/v4/systems"
+	"github.com/owasp-amass/config/config"
 )
 
 const (
@@ -51,7 +51,6 @@ type intelArgs struct {
 		IPv6         bool
 		ListSources  bool
 		ReverseWhois bool
-		Sources      bool
 		Verbose      bool
 	}
 	Filepaths struct {
@@ -88,12 +87,11 @@ func defineIntelOptionFlags(intelFlags *flag.FlagSet, args *intelArgs) {
 	intelFlags.BoolVar(&args.Options.IPv6, "ipv6", false, "Show the IPv6 addresses for discovered names")
 	intelFlags.BoolVar(&args.Options.ListSources, "list", false, "Print additional information")
 	intelFlags.BoolVar(&args.Options.ReverseWhois, "whois", false, "All provided domains are run through reverse whois")
-	intelFlags.BoolVar(&args.Options.Sources, "src", false, "Print data sources for the discovered names")
 	intelFlags.BoolVar(&args.Options.Verbose, "v", false, "Output status / debug / troubleshooting info")
 }
 
 func defineIntelFilepathFlags(intelFlags *flag.FlagSet, args *intelArgs) {
-	intelFlags.StringVar(&args.Filepaths.ConfigFile, "config", "", "Path to the INI configuration file. Additional details below")
+	intelFlags.StringVar(&args.Filepaths.ConfigFile, "config", "", "Path to the YAML configuration file. Additional details below")
 	intelFlags.StringVar(&args.Filepaths.Directory, "dir", "", "Path to the directory containing the output files")
 	intelFlags.Var(&args.Filepaths.Domains, "df", "Path to a file providing root domain names")
 	intelFlags.StringVar(&args.Filepaths.ExcludedSrcs, "ef", "", "Path to a file providing data sources to exclude")
@@ -139,9 +137,6 @@ func runIntelCommand(clArgs []string) {
 		commandUsage(intelUsageMsg, intelCommand, intelBuf)
 		os.Exit(1)
 	}
-
-	// Seed the default pseudo-random number generator
-	rand.Seed(time.Now().UTC().UnixNano())
 	if err := processIntelInputFiles(&args); err != nil {
 		fmt.Fprintf(color.Error, "%v\n", err)
 		os.Exit(1)
@@ -198,7 +193,10 @@ func runIntelCommand(clArgs []string) {
 	if err != nil {
 		return
 	}
-	sys.SetDataSources(datasrcs.GetAllSources(sys))
+
+	if err := sys.SetDataSources(datasrcs.GetAllSources(sys)); err != nil {
+		return
+	}
 
 	if args.OrganizationName != "" {
 		var asns []int
@@ -256,7 +254,9 @@ func runIntelCommand(clArgs []string) {
 		go func() { _ = ic.HostedDomains(ctx) }()
 	}
 
-	processIntelOutput(ic, &args)
+	if !processIntelOutput(ic, &args) {
+		os.Exit(1)
+	}
 }
 
 func printNetblocks(asns []int, cfg *config.Config, sys systems.System) {
@@ -275,7 +275,7 @@ func printNetblocks(asns []int, cfg *config.Config, sys systems.System) {
 	}
 }
 
-func processIntelOutput(ic *intel.Collection, args *intelArgs) {
+func processIntelOutput(ic *intel.Collection, args *intelArgs) bool {
 	var err error
 	dir := config.OutputDirectory(ic.Config.Dir)
 
@@ -299,21 +299,23 @@ func processIntelOutput(ic *intel.Collection, args *intelArgs) {
 		_, _ = outptr.Seek(0, 0)
 	}
 
+	var found bool
 	// Collect all the names returned by the intelligence collection
 	for out := range ic.Output {
-		source, _, ips := format.OutputLineParts(out, args.Options.Sources,
-			args.Options.IPs || args.Options.IPv4 || args.Options.IPv6, args.Options.DemoMode)
+		_, ips := format.OutputLineParts(out, args.Options.IPs || args.Options.IPv4 || args.Options.IPv6, args.Options.DemoMode)
 
 		if ips != "" {
 			ips = " " + ips
 		}
 
-		fmt.Fprintf(color.Output, "%s%s%s\n", blue(source), green(out.Domain), yellow(ips))
+		fmt.Fprintf(color.Output, "%s%s\n", green(out.Domain), yellow(ips))
 		// Handle writing the line to a specified output file
 		if outptr != nil {
-			fmt.Fprintf(outptr, "%s%s%s\n", source, out.Domain, ips)
+			fmt.Fprintf(outptr, "%s%s\n", out.Domain, ips)
 		}
+		found = true
 	}
+	return found
 }
 
 // Obtain parameters from provided input files
@@ -361,16 +363,16 @@ func (i intelArgs) OverrideConfig(conf *config.Config) error {
 		conf.Active = true
 	}
 	if len(i.Addresses) > 0 {
-		conf.Addresses = i.Addresses
+		conf.Scope.Addresses = i.Addresses
 	}
 	if len(i.ASNs) > 0 {
-		conf.ASNs = i.ASNs
+		conf.Scope.ASNs = i.ASNs
 	}
 	if len(i.CIDRs) > 0 {
-		conf.CIDRs = i.CIDRs
+		conf.Scope.CIDRs = i.CIDRs
 	}
 	if len(i.Ports) > 0 {
-		conf.Ports = i.Ports
+		conf.Scope.Ports = i.Ports
 	}
 	if i.Filepaths.Directory != "" {
 		conf.Dir = i.Filepaths.Directory

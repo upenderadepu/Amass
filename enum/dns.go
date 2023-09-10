@@ -1,78 +1,124 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package enum
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
-	amassdns "github.com/OWASP/Amass/v3/net/dns"
-	"github.com/OWASP/Amass/v3/requests"
-	"github.com/caffix/eventbus"
 	"github.com/caffix/pipeline"
-	"github.com/caffix/resolve"
+	"github.com/caffix/queue"
 	"github.com/miekg/dns"
-	"golang.org/x/net/publicsuffix"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/resolve"
 )
 
-// InitialQueryTypes include the DNS record types that are queried for a discovered name.
-var InitialQueryTypes = []uint16{
+const (
+	maxDNSQueryAttempts int           = 50
+	maxRcodeServerFails int           = 3
+	initialBackoffDelay time.Duration = 250 * time.Millisecond
+	maximumBackoffDelay time.Duration = 4 * time.Second
+)
+
+// FwdQueryTypes include the DNS record types that are queried for a discovered name.
+var FwdQueryTypes = []uint16{
 	dns.TypeCNAME,
 	dns.TypeA,
 	dns.TypeAAAA,
 }
 
-// dNSTask is the task that handles all DNS name resolution requests within the pipeline.
-type dNSTask struct {
-	enum *Enumeration
+var fwdQueryTypesLookup = map[uint16]int{dns.TypeCNAME: 0, dns.TypeA: 1, dns.TypeAAAA: 2}
+
+type req struct {
+	Ctx        context.Context
+	Data       pipeline.Data
+	Qtype      uint16
+	Attempts   int
+	Servfails  int
+	InScope    bool
+	Sent       bool
+	HasRecords bool
+}
+
+// dnsTask is the task that handles all DNS name resolution requests within the pipeline.
+type dnsTask struct {
+	sync.Mutex
+	once      sync.Once
+	trust     string
+	trusted   bool
+	enum      *Enumeration
+	done      chan struct{}
+	pool      *resolve.Resolvers
+	params    pipeline.TaskParams
+	reqs      map[string]*req
+	resps     chan *dns.Msg
+	respQueue queue.Queue
+	release   chan struct{}
 }
 
 // newDNSTask returns a dNSTask specific to the provided Enumeration.
-func newDNSTask(e *Enumeration) *dNSTask {
-	return &dNSTask{enum: e}
+func newDNSTask(e *Enumeration, trusted bool) *dnsTask {
+	trust := "untrusted"
+	pool := e.Sys.Resolvers()
+	qps := e.Config.ResolversQPS
+	if trusted {
+		trust = "trusted"
+		pool = e.Sys.TrustedResolvers()
+		qps = e.Config.TrustedQPS
+	}
+	plen := pool.Len() * qps
+
+	dt := &dnsTask{
+		trust:     trust,
+		trusted:   trusted,
+		enum:      e,
+		done:      make(chan struct{}, 2),
+		pool:      pool,
+		reqs:      make(map[string]*req),
+		resps:     make(chan *dns.Msg, plen),
+		respQueue: queue.NewQueue(),
+		release:   make(chan struct{}, plen),
+	}
+
+	for i := 0; i < plen; i++ {
+		dt.release <- struct{}{}
+	}
+
+	go dt.processResponses()
+	go dt.moveResponsesToQueue()
+	return dt
 }
 
-func (dt *dNSTask) blacklistTaskFunc() pipeline.TaskFunc {
-	return pipeline.TaskFunc(func(ctx context.Context, data pipeline.Data, tp pipeline.TaskParams) (pipeline.Data, error) {
+func (dt *dnsTask) stop() {
+	select {
+	case <-dt.done:
+		return
+	default:
+	}
+	close(dt.done)
+	// TODO: empty the channel and queue to delete requests
+}
+
+func (dt *dnsTask) moveResponsesToQueue() {
+	for {
 		select {
-		case <-ctx.Done():
-			return nil, nil
-		default:
+		case <-dt.done:
+			return
+		case r := <-dt.resps:
+			if r != nil {
+				dt.respQueue.Append(r)
+			}
 		}
-
-		var name string
-		switch v := data.(type) {
-		case *requests.DNSRequest:
-			if v != nil && v.Valid() {
-				name = v.Name
-			}
-		case *requests.ResolvedRequest:
-			if v != nil && v.Valid() {
-				name = v.Name
-			}
-		case *requests.SubdomainRequest:
-			if v != nil && v.Valid() {
-				name = v.Name
-			}
-		case *requests.ZoneXFRRequest:
-			if v != nil {
-				name = v.Name
-			}
-		default:
-			return data, nil
-		}
-
-		if name != "" && !dt.enum.Config.Blacklisted(name) {
-			return data, nil
-		}
-		return nil, nil
-	})
+	}
 }
 
-func (dt *dNSTask) rootTaskFunc() pipeline.TaskFunc {
+func (dt *dnsTask) rootTaskFunc() pipeline.TaskFunc {
 	return pipeline.TaskFunc(func(ctx context.Context, data pipeline.Data, tp pipeline.TaskParams) (pipeline.Data, error) {
 		select {
 		case <-ctx.Done():
@@ -84,124 +130,276 @@ func (dt *dNSTask) rootTaskFunc() pipeline.TaskFunc {
 		// Is this a root domain or proper subdomain name?
 		switch v := data.(type) {
 		case *requests.DNSRequest:
-			if v.Domain == "" || v.Name != v.Domain {
-				return data, nil
+			if v.Domain != "" && v.Name == v.Domain {
+				r = v.Clone().(*requests.DNSRequest)
 			}
-			r = v.Clone().(*requests.DNSRequest)
+			// send the PTR records straight to the store stage
+			if r != nil && (strings.HasSuffix(r.Name, ".in-addr.arpa") || strings.HasSuffix(r.Name, ".ip6.arpa")) {
+				pipeline.SendData(ctx, "store", r, tp)
+				return nil, nil
+			}
 		case *requests.SubdomainRequest:
 			r = &requests.DNSRequest{
 				Name:   v.Name,
 				Domain: v.Domain,
-				Tag:    v.Tag,
-				Source: v.Source,
 			}
-		default:
-			return data, nil
 		}
 
-		if dt.enum.Config.IsDomainInScope(r.Name) {
-			go func() {
-				dt.subdomainQueries(ctx, r, tp)
-				dt.queryServiceNames(ctx, r, tp)
-			}()
+		if r != nil && dt.enum.Config.IsDomainInScope(r.Name) {
+			go dt.subdomainQueries(ctx, r, tp)
 		}
 		return data, nil
 	})
 }
 
 // Process implements the pipeline Task interface.
-func (dt *dNSTask) Process(ctx context.Context, data pipeline.Data, tp pipeline.TaskParams) (pipeline.Data, error) {
+func (dt *dnsTask) Process(ctx context.Context, data pipeline.Data, tp pipeline.TaskParams) (pipeline.Data, error) {
 	select {
 	case <-ctx.Done():
+		return nil, nil
+	case <-dt.done:
 		return nil, nil
 	default:
 	}
 
-	switch v := data.(type) {
-	case *requests.DNSRequest:
-		return dt.processDNSRequest(ctx, v, tp)
-	case *requests.AddrRequest:
-		if dt.reverseDNSQuery(ctx, v.Address, tp) || v.InScope {
-			return data, nil
+	dt.once.Do(func() {
+		dt.Lock()
+		dt.params = tp
+		dt.Unlock()
+	})
+
+	if v, ok := data.(*requests.DNSRequest); ok {
+		qtype := FwdQueryTypes[0]
+		msg := resolve.QueryMsg(v.Name, qtype)
+		k := key(msg.Id, msg.Question[0].Name)
+
+		if dt.addReqWithIncrement(k, &req{
+			Ctx:        ctx,
+			Data:       data.Clone(),
+			Qtype:      qtype,
+			Attempts:   1,
+			HasRecords: len(v.Records) > 0,
+		}) {
+			dt.pool.Query(ctx, msg, dt.resps)
+		} else {
+			dt.enum.Config.Log.Printf("Failed to enter %s into the request registry on the %s DNS task", msg.Question[0].Name, dt.trust)
 		}
 		return nil, nil
 	}
 	return data, nil
 }
 
-func (dt *dNSTask) processDNSRequest(ctx context.Context, req *requests.DNSRequest, tp pipeline.TaskParams) (pipeline.Data, error) {
-	if req == nil || !req.Valid() {
-		return nil, nil
+func (dt *dnsTask) nextStage(ctx context.Context, data pipeline.Data) {
+	dt.Lock()
+	params := dt.params
+	dt.Unlock()
+
+	if params == nil {
+		return
 	}
-loop:
-	for _, t := range InitialQueryTypes {
+
+	stage := "validate"
+	if dt.trusted {
+		stage = "store"
+	}
+
+	pipeline.SendData(ctx, stage, data, params)
+}
+
+func key(id uint16, name string) string {
+	return fmt.Sprintf("%d:%s", id, strings.ToLower(resolve.RemoveLastDot(name)))
+}
+
+func (dt *dnsTask) getReq(key string) *req {
+	dt.Lock()
+	defer dt.Unlock()
+
+	if req, found := dt.reqs[key]; found {
+		return req
+	}
+	return nil
+}
+
+func (dt *dnsTask) addReq(key string, entry *req) bool {
+	dt.Lock()
+	defer dt.Unlock()
+
+	if _, found := dt.reqs[key]; !found {
+		dt.reqs[key] = entry
+		return true
+	}
+	return false
+}
+
+func (dt *dnsTask) addReqWithIncrement(key string, entry *req) bool {
+	added := dt.addReq(key, entry)
+
+	if added {
+		<-dt.release
+	}
+	return added
+}
+
+func (dt *dnsTask) delReq(key string) *req {
+	dt.Lock()
+	defer dt.Unlock()
+
+	if req, found := dt.reqs[key]; found {
+		dt.reqs[key] = nil
+		delete(dt.reqs, key)
+		return req
+	}
+	return nil
+}
+
+func (dt *dnsTask) delReqWithDecrement(key string) {
+	if req := dt.delReq(key); req != nil {
+		dt.release <- struct{}{}
+
+		if !req.Sent && (req.InScope || req.HasRecords) {
+			dt.nextStage(req.Ctx, req.Data)
+		}
+	}
+}
+
+func (dt *dnsTask) processResponses() {
+	for {
 		select {
-		case <-ctx.Done():
-			break loop
-		default:
+		case <-dt.done:
+			return
+		case <-dt.respQueue.Signal():
+			if element, ok := dt.respQueue.Next(); ok {
+				if msg, valid := element.(*dns.Msg); valid {
+					dt.processResp(msg)
+				}
+			}
 		}
+	}
+}
 
-		msg := resolve.QueryMsg(req.Name, t)
-		resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityLow, resolve.PoolRetryPolicy)
-		if err == nil && resp != nil && len(resp.Answer) > 0 {
-			if !requests.TrustedTag(req.Tag) &&
-				dt.enum.Sys.Pool().WildcardType(ctx, resp, req.Domain) != resolve.WildcardTypeNone {
-				break
-			}
+func (dt *dnsTask) processResp(resp *dns.Msg) {
+	k := key(resp.Id, resp.Question[0].Name)
 
-			ans := resolve.ExtractAnswers(resp)
-			if len(ans) == 0 {
-				continue
-			}
+	entry := dt.getReq(k)
+	if entry == nil {
+		dt.enum.Config.Log.Printf("Failed to find %s in the request registry on the %s DNS task", resp.Question[0].Name, dt.trust)
+		return
+	}
 
-			rr := resolve.AnswersByType(ans, t)
-			if len(rr) == 0 {
-				continue
-			}
+	switch resp.Rcode {
+	// check if the response indicates that the name doesn't exist
+	case dns.RcodeNameError:
+		dt.delReqWithDecrement(k)
+		return
+	// the rest are errors that should not continue across many resolvers
+	case dns.RcodeFormatError:
+		fallthrough
+	case dns.RcodeServerFailure:
+		fallthrough
+	case dns.RcodeNotImplemented:
+		fallthrough
+	case dns.RcodeRefused:
+		entry.Servfails++
+	}
 
-			req.Records = append(req.Records, convertAnswers(rr)...)
-			if t == dns.TypeCNAME {
-				break
-			}
+	ctx := entry.Ctx
+	qtype := resp.Question[0].Qtype
+	name := strings.ToLower(resolve.RemoveLastDot(resp.Question[0].Name))
+
+	select {
+	case <-ctx.Done():
+		dt.delReqWithDecrement(k)
+		return
+	default:
+	}
+
+	switch v := entry.Data.(type) {
+	case *requests.DNSRequest:
+		if resp.Rcode == dns.RcodeSuccess {
+			dt.processFwdRequest(ctx, resp, name, qtype, v, entry)
 		} else {
-			if err != nil && err.Error() == "All resolvers have been stopped" {
-				return nil, err
-			}
-			dt.handleResolverError(ctx, err)
+			go dt.retry(resolve.QueryMsg(v.Name, qtype), resp.Id, entry)
 		}
+	default:
+		dt.delReqWithDecrement(k)
 	}
-
-	if len(req.Records) > 0 {
-		return req, nil
-	}
-	return nil, nil
 }
 
-func (dt *dNSTask) handleResolverError(ctx context.Context, e error) {
-	cfg, bus, err := requests.ContextConfigBus(ctx)
-	if err != nil {
-		return
-	}
+func (dt *dnsTask) retry(msg *dns.Msg, id uint16, entry *req) {
+	k := key(id, msg.Question[0].Name)
 
-	rerr, ok := e.(*resolve.ResolveError)
-	if !ok {
-		return
+	entry.Attempts++
+	if entry.Attempts <= maxDNSQueryAttempts && entry.Servfails < maxRcodeServerFails {
+		dt.delReq(k)
+		dt.addReq(key(msg.Id, msg.Question[0].Name), entry)
+		time.Sleep(resolve.TruncatedExponentialBackoff(entry.Attempts-1, initialBackoffDelay, maximumBackoffDelay))
+		dt.pool.Query(entry.Ctx, msg, dt.resps)
+	} else {
+		dt.enum.Config.Log.Printf("%s was dropped after failing to resolve %d times on the %s DNS task", msg.Question[0].Name, entry.Attempts-1, dt.trust)
+		dt.delReqWithDecrement(k)
 	}
-	if rcode := rerr.Rcode; !cfg.Verbose && (rcode == resolve.TimeoutRcode || rcode == dns.RcodeRefused ||
-		rcode == resolve.ResolverErrRcode || rcode == dns.RcodeNameError || rcode == dns.RcodeServerFailure) {
-		return
-	}
-
-	bus.Publish(requests.LogTopic, eventbus.PriorityHigh, fmt.Sprintf("DNS: %v", e))
 }
 
-func (dt *dNSTask) subdomainQueries(ctx context.Context, req *requests.DNSRequest, tp pipeline.TaskParams) {
+func (dt *dnsTask) nextType(ctx context.Context, name string, id, qtype uint16, entry *req) {
+	k := key(id, name)
+
+	if idx, found := fwdQueryTypesLookup[qtype]; found && idx+1 < len(FwdQueryTypes) {
+		entry.Attempts = 1
+		entry.Servfails = 0
+		entry.Qtype = FwdQueryTypes[idx+1]
+		msg := resolve.QueryMsg(name, entry.Qtype)
+		dt.delReq(k)
+		dt.addReq(key(msg.Id, msg.Question[0].Name), entry)
+		dt.pool.Query(ctx, msg, dt.resps)
+	} else {
+		dt.delReqWithDecrement(k)
+	}
+}
+
+func (dt *dnsTask) processFwdRequest(ctx context.Context, resp *dns.Msg, name string, qtype uint16, req *requests.DNSRequest, entry *req) {
+	ans := resolve.ExtractAnswers(resp)
+	if len(ans) == 0 {
+		dt.nextType(ctx, name, resp.Id, qtype, entry)
+		return
+	}
+
+	rr := resolve.AnswersByType(ans, qtype)
+	if len(rr) == 0 {
+		dt.nextType(ctx, name, resp.Id, qtype, entry)
+		return
+	}
+
+	k := key(resp.Id, resp.Question[0].Name)
+	if !dt.trusted {
+		dt.nextStage(ctx, req)
+		entry.Sent = true
+		dt.delReqWithDecrement(k)
+		return
+	}
+
+	if dt.enum.wildcardDetected(ctx, req, resp) {
+		dt.delReqWithDecrement(k)
+		return
+	}
+
+	req.Records = append(req.Records, convertAnswers(rr)...)
+	entry.HasRecords = len(req.Records) > 0
+	// are there additional record types to query for?
+	if idx, found := fwdQueryTypesLookup[qtype]; found && qtype != dns.TypeCNAME && idx+1 < len(FwdQueryTypes) {
+		dt.nextType(ctx, name, resp.Id, qtype, entry)
+		return
+	}
+	// delReq will send the request to the next stage if it has records
+	dt.delReqWithDecrement(k)
+}
+
+func (dt *dnsTask) subdomainQueries(ctx context.Context, req *requests.DNSRequest, tp pipeline.TaskParams) {
 	ch := make(chan []requests.DNSAnswer, 4)
 
 	go dt.queryNS(ctx, req.Name, req.Domain, ch, tp)
-	go dt.queryMX(ctx, req.Name, ch)
-	go dt.querySOA(ctx, req.Name, ch)
-	go dt.querySPF(ctx, req.Name, ch)
+	go dt.queryMX(ctx, req.Name, ch, tp)
+	go dt.querySOA(ctx, req.Name, ch, tp)
+	go dt.querySPF(ctx, req.Name, ch, tp)
 
 	for i := 0; i < 4; i++ {
 		if rr := <-ch; rr != nil {
@@ -214,198 +412,120 @@ func (dt *dNSTask) subdomainQueries(ctx context.Context, req *requests.DNSReques
 	}
 }
 
-func (dt *dNSTask) queryNS(ctx context.Context, name, domain string, ch chan []requests.DNSAnswer, tp pipeline.TaskParams) {
-	msg := resolve.QueryMsg(name, dns.TypeNS)
+func (dt *dnsTask) queryNS(ctx context.Context, name, domain string, ch chan []requests.DNSAnswer, tp pipeline.TaskParams) {
 	// Obtain the DNS answers for the NS records related to the domain
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityHigh, resolve.PoolRetryPolicy)
-	if err == nil {
-		ans := resolve.ExtractAnswers(resp)
-		rr := resolve.AnswersByType(ans, dns.TypeNS)
+	if resp, err := dt.enum.dnsQuery(ctx, name, dns.TypeNS, dt.enum.Sys.TrustedResolvers(), maxDNSQueryAttempts); err == nil {
+		if ans := resolve.ExtractAnswers(resp); len(ans) > 0 {
+			if rr := resolve.AnswersByType(ans, dns.TypeNS); len(rr) > 0 {
+				var records []requests.DNSAnswer
 
-		var records []requests.DNSAnswer
-		for _, a := range rr {
-			pipeline.SendData(ctx, "active", &requests.ZoneXFRRequest{
-				Name:   name,
-				Domain: domain,
-				Server: a.Data,
-				Tag:    requests.DNS,
-				Source: "DNS",
-			}, tp)
+				for _, record := range rr {
+					pipeline.SendData(ctx, "active", &requests.ZoneXFRRequest{
+						Name:   name,
+						Domain: domain,
+						Server: record.Data,
+					}, tp)
+					records = append(records, convertAnswers([]*resolve.ExtractedAnswer{record})...)
+				}
 
-			records = append(records, convertAnswers([]*resolve.ExtractedAnswer{a})...)
+				ch <- records
+				return
+			}
 		}
-
-		ch <- records
-		return
 	}
-
-	dt.handleResolverError(ctx, err)
 	ch <- nil
 }
 
-func (dt *dNSTask) queryMX(ctx context.Context, name string, ch chan []requests.DNSAnswer) {
-	msg := resolve.QueryMsg(name, dns.TypeMX)
+func (dt *dnsTask) queryMX(ctx context.Context, name string, ch chan []requests.DNSAnswer, tp pipeline.TaskParams) {
 	// Obtain the DNS answers for the MX records related to the domain
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityHigh, resolve.PoolRetryPolicy)
-	if err == nil {
-		ans := resolve.ExtractAnswers(resp)
-		rr := resolve.AnswersByType(ans, dns.TypeMX)
-
-		ch <- convertAnswers(rr)
-		return
+	if resp, err := dt.enum.dnsQuery(ctx, name, dns.TypeMX, dt.enum.Sys.TrustedResolvers(), maxDNSQueryAttempts); err == nil {
+		if ans := resolve.ExtractAnswers(resp); len(ans) > 0 {
+			if rr := resolve.AnswersByType(ans, dns.TypeMX); len(rr) > 0 {
+				ch <- convertAnswers(rr)
+				return
+			}
+		}
 	}
-
-	dt.handleResolverError(ctx, err)
 	ch <- nil
 }
 
-func (dt *dNSTask) querySOA(ctx context.Context, name string, ch chan []requests.DNSAnswer) {
-	msg := resolve.QueryMsg(name, dns.TypeSOA)
+func (dt *dnsTask) querySOA(ctx context.Context, name string, ch chan []requests.DNSAnswer, tp pipeline.TaskParams) {
 	// Obtain the DNS answers for the SOA records related to the domain
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityHigh, resolve.PoolRetryPolicy)
-	if err == nil {
-		ans := resolve.ExtractAnswers(resp)
-		rr := resolve.AnswersByType(ans, dns.TypeSOA)
+	if resp, err := dt.enum.dnsQuery(ctx, name, dns.TypeSOA, dt.enum.Sys.TrustedResolvers(), maxDNSQueryAttempts); err == nil {
+		if ans := resolve.ExtractAnswers(resp); len(ans) > 0 {
+			if rr := resolve.AnswersByType(ans, dns.TypeSOA); len(rr) > 0 {
+				var records []requests.DNSAnswer
 
-		var records []requests.DNSAnswer
-		for _, a := range rr {
-			pieces := strings.Split(a.Data, ",")
-			a.Data = pieces[len(pieces)-1]
+				for _, a := range rr {
+					pieces := strings.Split(a.Data, ",")
+					a.Data = pieces[len(pieces)-1]
+					records = append(records, convertAnswers([]*resolve.ExtractedAnswer{a})...)
+				}
+				ch <- records
+			}
+		}
+	}
+	ch <- nil
+}
 
-			records = append(records, convertAnswers([]*resolve.ExtractedAnswer{a})...)
+func (dt *dnsTask) querySPF(ctx context.Context, name string, ch chan []requests.DNSAnswer, tp pipeline.TaskParams) {
+	// Obtain the DNS answers for the SPF records related to the domain
+	if resp, err := dt.enum.dnsQuery(ctx, name, dns.TypeSPF, dt.enum.Sys.TrustedResolvers(), maxDNSQueryAttempts); err == nil {
+		if ans := resolve.ExtractAnswers(resp); len(ans) > 0 {
+			if rr := resolve.AnswersByType(ans, dns.TypeSPF); len(rr) > 0 {
+				ch <- convertAnswers(rr)
+				return
+			}
+		}
+	}
+	ch <- nil
+}
+
+func (e *Enumeration) fwdQuery(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	resp, err := e.dnsQuery(ctx, name, qtype, e.Sys.Resolvers(), maxDNSQueryAttempts)
+	if err != nil {
+		return resp, err
+	}
+	if resp == nil && err == nil {
+		return nil, errors.New("query failed")
+	}
+
+	resp, err = e.dnsQuery(ctx, name, qtype, e.Sys.TrustedResolvers(), maxDNSQueryAttempts)
+	if resp == nil && err == nil {
+		err = errors.New("query failed")
+	}
+	return resp, err
+}
+
+func (e *Enumeration) dnsQuery(ctx context.Context, name string, qtype uint16, r *resolve.Resolvers, attempts int) (*dns.Msg, error) {
+	msg := resolve.QueryMsg(name, qtype)
+
+	for num := 0; num < attempts; num++ {
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("context expired")
+		default:
 		}
 
-		ch <- records
-		return
+		resp, err := r.QueryBlocking(ctx, msg)
+		if err != nil {
+			continue
+		}
+		if resp.Rcode == dns.RcodeNameError {
+			return nil, errors.New("name does not exist")
+		}
+		if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+			return nil, errors.New("no record of this type")
+		}
+		if resp.Rcode == dns.RcodeSuccess {
+			return resp, nil
+		}
 	}
-
-	dt.handleResolverError(ctx, err)
+	return nil, nil
 }
 
-func (dt *dNSTask) querySPF(ctx context.Context, name string, ch chan []requests.DNSAnswer) {
-	msg := resolve.QueryMsg(name, dns.TypeSPF)
-	// Obtain the DNS answers for the SPF records related to the domain
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityHigh, resolve.PoolRetryPolicy)
-	if err == nil {
-		ans := resolve.ExtractAnswers(resp)
-		rr := resolve.AnswersByType(ans, dns.TypeSPF)
-
-		ch <- convertAnswers(rr)
-		return
-	}
-
-	dt.handleResolverError(ctx, err)
-	ch <- nil
-}
-
-func (dt *dNSTask) queryServiceNames(ctx context.Context, req *requests.DNSRequest, tp pipeline.TaskParams) {
-	var wg sync.WaitGroup
-
-	wg.Add(len(popularSRVRecords))
-	for _, name := range popularSRVRecords {
-		go dt.querySingleServiceName(ctx, name+"."+req.Name, req.Domain, &wg, tp)
-	}
-
-	wg.Wait()
-}
-
-func (dt *dNSTask) querySingleServiceName(ctx context.Context, name, domain string, wg *sync.WaitGroup, tp pipeline.TaskParams) {
-	defer wg.Done()
-
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	msg := resolve.QueryMsg(name, dns.TypeSRV)
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityLow, resolve.PoolRetryPolicy)
-	if err != nil || len(resp.Answer) == 0 {
-		dt.handleResolverError(ctx, err)
-		return
-	}
-
-	ans := resolve.ExtractAnswers(resp)
-	if len(ans) == 0 {
-		return
-	}
-
-	rr := resolve.AnswersByType(ans, dns.TypeSRV)
-	if len(rr) == 0 {
-		return
-	}
-
-	req := &requests.DNSRequest{
-		Name:    name,
-		Domain:  domain,
-		Records: convertAnswers(rr),
-		Tag:     requests.DNS,
-		Source:  "DNS",
-	}
-
-	if req.Valid() && dt.enum.Sys.Pool().WildcardType(ctx, resp, domain) == resolve.WildcardTypeNone {
-		pipeline.SendData(ctx, "filter", req, tp)
-	}
-}
-
-func (dt *dNSTask) reverseDNSQuery(ctx context.Context, addr string, tp pipeline.TaskParams) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
-
-	msg := resolve.ReverseMsg(addr)
-	if msg == nil {
-		return false
-	}
-
-	resp, err := dt.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityLow, resolve.PoolRetryPolicy)
-	if err != nil {
-		return false
-	}
-
-	ans := resolve.ExtractAnswers(resp)
-	if len(ans) == 0 {
-		return false
-	}
-
-	rr := resolve.AnswersByType(ans, dns.TypePTR)
-	if len(rr) == 0 {
-		return false
-	}
-
-	answer := strings.ToLower(resolve.RemoveLastDot(rr[0].Data))
-	if amassdns.RemoveAsteriskLabel(answer) != answer {
-		return false
-	}
-	// Check that the name discovered is in scope
-	d := dt.enum.Config.WhichDomain(answer)
-	if d == "" {
-		return false
-	}
-	if re := dt.enum.Config.DomainRegex(d); re == nil || re.FindString(answer) != answer {
-		return false
-	}
-
-	ptr := resolve.RemoveLastDot(rr[0].Name)
-	domain, err := publicsuffix.EffectiveTLDPlusOne(ptr)
-	if err != nil {
-		return true
-	}
-
-	pipeline.SendData(ctx, "filter", &requests.DNSRequest{
-		Name:   ptr,
-		Domain: domain,
-		Records: []requests.DNSAnswer{{
-			Name: ptr,
-			Type: 12,
-			Data: answer,
-		}},
-		Tag:    requests.DNS,
-		Source: "Reverse DNS",
-	}, tp)
-	return true
+func (e *Enumeration) wildcardDetected(ctx context.Context, req *requests.DNSRequest, resp *dns.Msg) bool {
+	return e.Sys.TrustedResolvers().WildcardDetected(ctx, resp, req.Domain)
 }
 
 func convertAnswers(ans []*resolve.ExtractedAnswer) []requests.DNSAnswer {

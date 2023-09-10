@@ -1,46 +1,17 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package requests
 
 import (
-	"context"
-	"errors"
 	"net"
 	"strings"
 	"time"
 
-	"github.com/OWASP/Amass/v3/config"
-	amassdns "github.com/OWASP/Amass/v3/net/dns"
-	"github.com/caffix/eventbus"
 	"github.com/caffix/pipeline"
 	"github.com/miekg/dns"
-)
-
-// Request tag types.
-const (
-	NONE     = "none"
-	ALT      = "alt"
-	GUESS    = "guess"
-	ARCHIVE  = "archive"
-	API      = "api"
-	AXFR     = "axfr"
-	BRUTE    = "brute"
-	CERT     = "cert"
-	CRAWL    = "crawl"
-	DNS      = "dns"
-	RIR      = "rir"
-	EXTERNAL = "ext"
-	SCRAPE   = "scrape"
-)
-
-// ContextKey is the type used for context value keys.
-type ContextKey int
-
-// The key used when values are obtained during service requests.
-const (
-	ContextConfig ContextKey = iota
-	ContextEventBus
+	amassdns "github.com/owasp-amass/amass/v4/net/dns"
 )
 
 // Request Pub/Sub topics used across Amass.
@@ -56,33 +27,6 @@ const (
 	OutputTopic        = "amass:output"
 )
 
-// ContextConfigBus extracts the Config and EventBus references from the Context argument.
-func ContextConfigBus(ctx context.Context) (*config.Config, *eventbus.EventBus, error) {
-	var ok bool
-	var cfg *config.Config
-
-	if c := ctx.Value(ContextConfig); c != nil {
-		cfg, ok = c.(*config.Config)
-		if !ok {
-			return nil, nil, errors.New("Failed to extract the configuration from the context")
-		}
-	} else {
-		return nil, nil, errors.New("Failed to extract the configuration from the context")
-	}
-
-	var bus *eventbus.EventBus
-	if b := ctx.Value(ContextEventBus); b != nil {
-		bus, ok = b.(*eventbus.EventBus)
-		if !ok {
-			return nil, nil, errors.New("Failed to extract the event bus from the context")
-		}
-	} else {
-		return nil, nil, errors.New("Failed to extract the event bus from the context")
-	}
-
-	return cfg, bus, nil
-}
-
 // DNSAnswer is the type used by Amass to represent a DNS record.
 type DNSAnswer struct {
 	Name string `json:"name"`
@@ -96,8 +40,6 @@ type DNSRequest struct {
 	Name    string
 	Domain  string
 	Records []DNSAnswer
-	Tag     string
-	Source  string
 }
 
 // Clone implements pipeline Data.
@@ -106,8 +48,6 @@ func (d *DNSRequest) Clone() pipeline.Data {
 		Name:    d.Name,
 		Domain:  d.Domain,
 		Records: append([]DNSAnswer(nil), d.Records...),
-		Tag:     d.Tag,
-		Source:  d.Source,
 	}
 }
 
@@ -134,8 +74,6 @@ type ResolvedRequest struct {
 	Name    string
 	Domain  string
 	Records []DNSAnswer
-	Tag     string
-	Source  string
 }
 
 // Clone implements pipeline Data.
@@ -144,8 +82,6 @@ func (r *ResolvedRequest) Clone() pipeline.Data {
 		Name:    r.Name,
 		Domain:  r.Domain,
 		Records: append([]DNSAnswer(nil), r.Records...),
-		Tag:     r.Tag,
-		Source:  r.Source,
 	}
 }
 
@@ -171,8 +107,6 @@ type SubdomainRequest struct {
 	Name    string
 	Domain  string
 	Records []DNSAnswer
-	Tag     string
-	Source  string
 	Times   int
 }
 
@@ -182,8 +116,6 @@ func (s *SubdomainRequest) Clone() pipeline.Data {
 		Name:    s.Name,
 		Domain:  s.Domain,
 		Records: append([]DNSAnswer(nil), s.Records...),
-		Tag:     s.Tag,
-		Source:  s.Source,
 	}
 }
 
@@ -212,8 +144,6 @@ type ZoneXFRRequest struct {
 	Name   string
 	Domain string
 	Server string
-	Tag    string
-	Source string
 }
 
 // Clone implements pipeline Data.
@@ -222,8 +152,6 @@ func (z *ZoneXFRRequest) Clone() pipeline.Data {
 		Name:   z.Name,
 		Domain: z.Domain,
 		Server: z.Server,
-		Tag:    z.Tag,
-		Source: z.Source,
 	}
 }
 
@@ -235,8 +163,6 @@ type AddrRequest struct {
 	Address string
 	InScope bool
 	Domain  string
-	Tag     string
-	Source  string
 }
 
 // Clone implements pipeline Data.
@@ -245,8 +171,6 @@ func (a *AddrRequest) Clone() pipeline.Data {
 		Address: a.Address,
 		InScope: a.InScope,
 		Domain:  a.Domain,
-		Tag:     a.Tag,
-		Source:  a.Source,
 	}
 }
 
@@ -276,8 +200,6 @@ type ASNRequest struct {
 	AllocationDate time.Time
 	Description    string
 	Netblocks      []string
-	Tag            string
-	Source         string
 }
 
 // Clone implements pipeline Data.
@@ -291,8 +213,6 @@ func (a *ASNRequest) Clone() pipeline.Data {
 		AllocationDate: a.AllocationDate,
 		Description:    a.Description,
 		Netblocks:      a.Netblocks,
-		Tag:            a.Tag,
-		Source:         a.Source,
 	}
 }
 
@@ -321,8 +241,6 @@ type WhoisRequest struct {
 	Company    string
 	Email      string
 	NewDomains []string
-	Tag        string
-	Source     string
 }
 
 // Output contains all the output data for an enumerated DNS name.
@@ -330,8 +248,6 @@ type Output struct {
 	Name      string        `json:"name"`
 	Domain    string        `json:"domain"`
 	Addresses []AddressInfo `json:"addresses"`
-	Tag       string        `json:"tag"`
-	Sources   []string      `json:"sources"`
 }
 
 // Clone implements pipeline Data.
@@ -340,8 +256,6 @@ func (o *Output) Clone() pipeline.Data {
 		Name:      o.Name,
 		Domain:    o.Domain,
 		Addresses: append([]AddressInfo(nil), o.Addresses...),
-		Tag:       o.Tag,
-		Sources:   append([]string(nil), o.Sources...),
 	}
 }
 
@@ -350,14 +264,8 @@ func (o *Output) MarkAsProcessed() {}
 
 // Complete checks that all the required fields have been populated.
 func (o *Output) Complete(passive bool) bool {
-	if o.Name == "" || o.Domain == "" || o.Tag == "" || len(o.Sources) == 0 {
+	if o.Name == "" || o.Domain == "" {
 		return false
-	}
-
-	for _, src := range o.Sources {
-		if src == "" {
-			return false
-		}
 	}
 
 	if !passive {
@@ -378,15 +286,6 @@ type AddressInfo struct {
 	CIDRStr     string     `json:"cidr"`
 	ASN         int        `json:"asn"`
 	Description string     `json:"desc"`
-}
-
-// TrustedTag returns true when the tag parameter is of a type that should be trusted even
-// facing DNS wildcards.
-func TrustedTag(tag string) bool {
-	if tag == ARCHIVE || tag == AXFR || tag == CERT || tag == CRAWL || tag == DNS {
-		return true
-	}
-	return false
 }
 
 // SanitizeDNSRequest cleans the Name and Domain elements of the receiver.

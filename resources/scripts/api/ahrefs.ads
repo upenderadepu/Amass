@@ -1,5 +1,6 @@
--- Copyright 2021 Jeff Foley. All rights reserved.
+-- Copyright © by Jeff Foley 2017-2023. All rights reserved.
 -- Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+-- SPDX-License-Identifier: Apache-2.0
 
 local url = require("url")
 local json = require("json")
@@ -14,7 +15,7 @@ end
 function check()
     local c
     local cfg = datasrc_config()
-    if cfg ~= nil then
+    if (cfg ~= nil) then
         c = cfg.credentials
     end
 
@@ -27,7 +28,7 @@ end
 function vertical(ctx, domain)
     local c
     local cfg = datasrc_config()
-    if cfg ~= nil then
+    if (cfg ~= nil) then
         c = cfg.credentials
     end
 
@@ -39,15 +40,24 @@ function vertical(ctx, domain)
     if (err ~= nil and err ~= "") then
         log(ctx, "vertical request to service failed: " .. err)
         return
-    end
-
-    local d = json.decode(resp)
-    if (d == nil or d.refpages == nil or #(d.refpages) == 0) then
+    elseif (resp.status_code < 200 or resp.status_code >= 400) then
+        log(ctx, "vertical request to service returned with status: " .. resp.status)
         return
     end
 
-    for _, r in pairs(d.refpages) do
-        send_names(ctx, r.url_to)
+    local d = json.decode(resp.body)
+    if (d == nil) then
+        log(ctx, "failed to decode the JSON response")
+        return
+    elseif (d.error ~= nil and d.error ~= "") then
+        log(ctx, "error returned by the service: " .. j.error)
+        return
+    end
+
+    for _, item in pairs(d.pages) do
+        if (item ~= nil and item.url ~= nil and item.url ~= "") then
+            send_names(ctx, item.url)
+        end
     end
 end
 
@@ -55,10 +65,10 @@ function build_url(domain, key)
     local params = {
         ['target']=domain,
         ['token']=key,
-        ['from']="backlinks",
+        ['from']="ahrefs_rank",
         ['mode']="subdomains",
         ['limit']="1000",
-        ['order_by']="first_seen%3Adesc",
+        ['order_by']="ahrefs_rank%3Adesc",
         ['output']="json",
     }
 

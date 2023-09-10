@@ -34,16 +34,29 @@ builds:
 
 archives:
   -
-    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
-    replacements:
-      darwin: macos
-      386: i386
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "darwin" }}macos
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
     wrap_in_directory: true
     format: zip
     files:
       - LICENSE
       - README.md
-      - examples/config.ini
+      - examples/config.yaml
+      - examples/datasources.yaml
+
+sboms:
+  - documents:
+      - "{{ .Binary }}_{{ .Os }}_{{ .Arch }}.bom.json"
+    artifacts: binary
+    cmd: cyclonedx-gomod
+    env:
+      - GOOS={{ .Os }}
+      - GOARCH={{ .Arch }}
+    args: [ "app", "-main", "cmd/amass", "-licenses", "-packages", "-json", "-output", "$document", "../" ]
 
 checksum:
   name_template: "{{ .ProjectName }}_checksums.txt"
@@ -57,17 +70,17 @@ changelog:
 
 release:
   github:
-    owner: OWASP
-    name: Amass
+    owner: owasp-amass
+    name: amass
 
 brews:
   -
     name: amass
-    tap:
-      owner: caffix
+    repository:
+      owner: owasp-amass
       name: homebrew-amass
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    url_template: "https://github.com/OWASP/Amass/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    url_template: "https://github.com/owasp-amass/amass/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
     commit_author:
       name: caffix
       email: caffix@users.noreply.github.com

@@ -1,15 +1,15 @@
-// Copyright 2020-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package scripting
 
 import (
 	"context"
 	"errors"
+	"os"
 	"regexp"
 
-	"github.com/OWASP/Amass/v3/requests"
-	"github.com/caffix/eventbus"
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -27,13 +27,17 @@ func (s *Script) contextToUserData(ctx context.Context) *lua.LUserData {
 	return ud
 }
 
-func checkContextExpired(ctx context.Context) error {
+func contextExpired(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+
 	select {
 	case <-ctx.Done():
-		return errors.New("context expired")
+		return true
 	default:
 	}
-	return nil
+	return false
 }
 
 func extractContext(udata *lua.LUserData) (context.Context, error) {
@@ -52,19 +56,17 @@ func extractContext(udata *lua.LUserData) (context.Context, error) {
 	}
 
 	ctx := wrapper.Ctx
-	if err := checkContextExpired(ctx); err != nil {
-		return nil, err
+	if contextExpired(ctx) {
+		return nil, errors.New("context expired")
 	}
 	return ctx, nil
 }
 
 // Wrapper so that scripts can write messages to the Amass log.
 func (s *Script) log(L *lua.LState) int {
-	if ctx, err := extractContext(L.CheckUserData(1)); err == nil {
-		if _, bus, err := requests.ContextConfigBus(ctx); err == nil {
-			if msg := L.CheckString(2); msg != "" {
-				bus.Publish(requests.LogTopic, eventbus.PriorityHigh, s.String()+": "+msg)
-			}
+	if _, err := extractContext(L.CheckUserData(1)); err == nil {
+		if msg := L.CheckString(2); msg != "" {
+			s.sys.Config().Log.Print(s.String() + ": " + msg)
 		}
 	}
 	return 0
@@ -110,12 +112,24 @@ func (s *Script) submatch(L *lua.LState) int {
 			}
 		}
 	}
-
 	if tb.Len() > 0 {
 		L.Push(tb)
 	} else {
 		L.Push(lua.LNil)
 	}
+	return 1
+}
+
+// Wrapper that exposes a function that returns the modification date/time of a file.
+func (s *Script) modDateTime(L *lua.LState) int {
+	var seconds int64
+
+	fpath := L.CheckString(1)
+	if fi, err := os.Stat(fpath); err == nil {
+		seconds = fi.ModTime().Unix()
+	}
+
+	L.Push(lua.LNumber(seconds))
 	return 1
 }
 

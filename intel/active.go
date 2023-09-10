@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package intel
 
@@ -8,10 +9,10 @@ import (
 	"net"
 	"strings"
 
-	"github.com/OWASP/Amass/v3/net/http"
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/pipeline"
 	"github.com/caffix/queue"
+	"github.com/owasp-amass/amass/v4/net/http"
+	"github.com/owasp-amass/amass/v4/requests"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -118,7 +119,7 @@ func (a *activeTask) certEnumeration(ctx context.Context, req *requests.AddrRequ
 
 	c := a.c
 	addrinfo := requests.AddressInfo{Address: ip}
-	for _, name := range http.PullCertificateNames(ctx, req.Address, c.Config.Ports) {
+	for _, name := range http.PullCertificateNames(ctx, req.Address, c.Config.Scope.Ports) {
 		if n := strings.TrimSpace(name); n != "" {
 			domain, err := publicsuffix.EffectiveTLDPlusOne(n)
 			if err != nil {
@@ -130,8 +131,6 @@ func (a *activeTask) certEnumeration(ctx context.Context, req *requests.AddrRequ
 					Name:      domain,
 					Domain:    domain,
 					Addresses: []requests.AddressInfo{addrinfo},
-					Tag:       requests.CERT,
-					Sources:   []string{"Active Cert"},
 				}, tp)
 			}
 		}

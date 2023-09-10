@@ -1,5 +1,6 @@
--- Copyright 2017-2021 Jeff Foley. All rights reserved.
+-- Copyright © by Jeff Foley 2017-2023. All rights reserved.
 -- Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+-- SPDX-License-Identifier: Apache-2.0
 
 name = "ShadowServer"
 type = "misc"
@@ -24,7 +25,6 @@ function asn(ctx, addr, asn)
 
         result = origin(ctx, addr)
         if (result == nil) then return end
-        check_rate_limit()
 
         local cidrs = netblocks(ctx, result.asn)
         if (cidrs == nil or #cidrs == 0) then return end
@@ -33,7 +33,6 @@ function asn(ctx, addr, asn)
         local cidrs = netblocks(ctx, asn)
         if (cidrs == nil or #cidrs == 0) then return end
 
-        check_rate_limit()
         if (addr == "") then
             local parts = split(cidrs[1], "/")
             if (#parts < 2) then return end
@@ -46,7 +45,6 @@ function asn(ctx, addr, asn)
     end
 
     new_asn(ctx, result)
-    check_rate_limit()
 end
 
 function origin(ctx, addr)
@@ -54,7 +52,10 @@ function origin(ctx, addr)
 
     local name = reverse_ip(addr) ..  ".origin.asn.shadowserver.org"
     local resp, err = resolve(ctx, name, "TXT", false)
-    if ((err ~= nil and err ~= "") or #resp == 0) then return nil end
+    if ((err ~= nil and err ~= "") or #resp == 0) then
+        log(ctx, "failed to resolve the TXT record for " .. name .. ": " .. err)
+        return nil
+    end
 
     local fields = split(resp[1].rrdata, "|")
     return {
@@ -68,17 +69,22 @@ end
 
 function netblocks(ctx, asn)
     local conn, err = socket.connect(ctx, shadowServerWhoisAddress, 43, "tcp")
-	if (err ~= nil and err ~= "") then return nil end
+    if (err ~= nil and err ~= "") then
+        log(ctx, "failed to connect to " .. shadowServerWhoisAddress .. " on port 43: " .. err)
+        return nil
+    end
 
     _, err = conn:send("prefix " .. tostring(asn) .. "\n")
     if (err ~= nil and err ~= "") then
+        log(ctx, "failed to send the ASN parameter to " .. shadowServerWhoisAddress .. ": " .. err)
         conn:close()
         return nil
     end
 
     local data
-	data, err = conn:recv_all()
-	if (err ~= nil and err ~= "") then
+    data, err = conn:recv_all()
+    if (err ~= nil and err ~= "") then
+        log(ctx, "failed to receive the response from " .. shadowServerWhoisAddress .. ": " .. err)
         conn:close()
         return nil
     end
@@ -107,7 +113,10 @@ end
 
 function get_whois_addr(ctx)
     local resp, err = resolve(ctx, shadowServerWhoisURL, "A", false)
-    if ((err ~= nil and err ~= "") or #resp == 0) then return "" end
+    if ((err ~= nil and err ~= "") or #resp == 0) then
+        log(ctx, "failed to resolve the A record for " .. shadowServerWhoisURL .. ": " .. err)
+        return ""
+    end
     return resp[1].rrdata
 end
 
@@ -137,8 +146,6 @@ function reverse_ip(addr)
 end
 
 function trim_space(s)
-    if (s == nil) then
-        return ""
-    end
+    if (s == nil) then return "" end
     return s:match( "^%s*(.-)%s*$" )
 end

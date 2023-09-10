@@ -2,11 +2,10 @@
 # [![OWASP Logo](../images/owasp_logo.png) OWASP Amass](https://owasp.org/www-project-amass/) - Installation Guide
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/amass.svg)](https://repology.org/metapackage/amass/versions)
-[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-white.svg)](https://snapcraft.io/amass)
 
 ## Prebuilt Binaries
 
-A [precompiled version is available](https://github.com/OWASP/Amass/releases) with each release.
+A [precompiled version is available](https://github.com/owasp-amass/amass/releases) with each release.
 
 Using this installation option on macOS is could result in an 'unidentified developer' warning. This can be resolved by following the steps below:
 
@@ -21,7 +20,7 @@ Using this installation option on macOS is could result in an 'unidentified deve
 1. Build the [Docker](https://docs.docker.com/) image:
 
 ```bash
-docker build -t amass https://github.com/OWASP/Amass.git
+docker build -t amass https://github.com/owasp-amass/amass.git
 ```
 
 2. Run the Docker image:
@@ -40,31 +39,15 @@ docker run -v OUTPUT_DIR_PATH:/.config/amass/ amass enum -brute -w /wordlists/al
 
 ## From Source
 
-If you prefer to build your own binary from the latest release of the source code, make sure you have a correctly configured **Go >= 1.14** environment. More information about how to achieve this can be found [on the golang website.](https://golang.org/doc/install).
+If you prefer to build your own binary from the latest release of the source code, make sure you have a correctly configured **Go >= 1.18** environment. More information about how to achieve this can be found [on the golang website.](https://golang.org/doc/install).
 
-Simply execute the following commands:
-
-1. Download OWASP Amass:
+Simply execute the following command:
 
 ```bash
-go get -v github.com/OWASP/Amass/v3/...
+go install -v github.com/owasp-amass/amass/v4/...@master
 ```
 
 At this point, the binary should be in *$GOPATH/bin*.
-
-2. If you'd like to rebuild the binary from the project source code:
-
-```bash
-cd $GOPATH/src/github.com/OWASP/Amass
-
-go install ./...
-```
-
-Several wordlists for performing DNS name alterations and brute forcing can be found in the following directory:
-
-```bash
-ls $GOPATH/src/github.com/OWASP/Amass/examples/wordlists/
-```
 
 ## Packages Maintained by the Amass Project
 
@@ -73,28 +56,8 @@ ls $GOPATH/src/github.com/OWASP/Amass/examples/wordlists/
 For **Homebrew**, the following two commands will install Amass into your environment:
 
 ```bash
-brew tap caffix/amass
+brew tap owasp-amass/amass
 brew install amass
-```
-
-### Snapcraft
-
-If your operating environment supports [Snap](https://docs.snapcraft.io/core/install), you can [click here to install](https://snapcraft.io/amass), or perform the following from the command-line:
-
-```bash
-sudo snap install amass
-```
-
-Add the Snap bin directory to your PATH:
-
-```bash
-export PATH=$PATH:/snap/bin
-```
-
-Periodically, execute the following command to update all your snap packages:
-
-```bash
-sudo snap refresh
 ```
 
 ## Packages Maintained by a Third Party

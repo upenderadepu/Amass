@@ -1,5 +1,6 @@
-// Copyright 2017-2021 Jeff Foley. All rights reserved.
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
 
 package enum
 
@@ -7,32 +8,33 @@ import (
 	"context"
 	"strings"
 
-	"github.com/OWASP/Amass/v3/requests"
 	"github.com/caffix/pipeline"
-	"github.com/caffix/queue"
-	"github.com/caffix/resolve"
 	"github.com/caffix/stringset"
+	"github.com/owasp-amass/amass/v4/requests"
+	"github.com/owasp-amass/asset-db/types"
+	oam "github.com/owasp-amass/open-asset-model"
+	"github.com/owasp-amass/open-asset-model/domain"
 )
 
 // subdomainTask handles newly discovered proper subdomain names in the enumeration.
 type subdomainTask struct {
 	enum            *Enumeration
-	queue           queue.Queue
 	cnames          *stringset.Set
 	withinWildcards *stringset.Set
 	timesChan       chan *timesReq
 	done            chan struct{}
+	possibleApexes  map[string]struct{}
 }
 
 // newSubdomainTask returns an initialized SubdomainTask.
 func newSubdomainTask(e *Enumeration) *subdomainTask {
 	r := &subdomainTask{
 		enum:            e,
-		queue:           queue.NewQueue(),
 		cnames:          stringset.New(),
 		withinWildcards: stringset.New(),
 		timesChan:       make(chan *timesReq, 10),
 		done:            make(chan struct{}, 2),
+		possibleApexes:  make(map[string]struct{}),
 	}
 
 	go r.timesManager()
@@ -42,9 +44,9 @@ func newSubdomainTask(e *Enumeration) *subdomainTask {
 // Stop releases resources allocated by the instance.
 func (r *subdomainTask) Stop() {
 	close(r.done)
-	r.queue.Process(func(e interface{}) {})
 	r.cnames.Close()
 	r.withinWildcards.Close()
+	r.linkNodesToApexes()
 }
 
 // Process implements the pipeline Task interface.
@@ -62,7 +64,6 @@ func (r *subdomainTask) Process(ctx context.Context, data pipeline.Data, tp pipe
 	if req == nil || !r.enum.Config.IsDomainInScope(req.Name) {
 		return nil, nil
 	}
-
 	// Do not further evaluate service subdomains
 	for _, label := range strings.Split(req.Name, ".") {
 		l := strings.ToLower(label)
@@ -73,12 +74,10 @@ func (r *subdomainTask) Process(ctx context.Context, data pipeline.Data, tp pipe
 	}
 
 	if r.checkForSubdomains(ctx, req, tp) {
-		r.queue.Append(&requests.ResolvedRequest{
+		r.enum.sendRequests(&requests.ResolvedRequest{
 			Name:    req.Name,
 			Domain:  req.Domain,
 			Records: req.Records,
-			Tag:     req.Tag,
-			Source:  req.Source,
 		})
 	}
 	return req, nil
@@ -94,7 +93,7 @@ func (r *subdomainTask) checkForSubdomains(ctx context.Context, req *requests.DN
 	dlabels := strings.Split(req.Domain, ".")
 	// It cannot have fewer labels than the root domain name
 	if len(nlabels)-1 < len(dlabels) {
-		return false
+		return true
 	}
 
 	sub := strings.TrimSpace(strings.Join(nlabels[1:], "."))
@@ -104,87 +103,41 @@ func (r *subdomainTask) checkForSubdomains(ctx context.Context, req *requests.DN
 		return false
 	} else if times > 1 && r.withinWildcards.Has(sub) {
 		return false
-	} else if times == 1 && r.enum.Graph.IsCNAMENode(ctx, sub) {
+	} else if times == 1 && r.enum.graph.IsCNAMENode(ctx, sub, r.enum.Config.CollectionStartTime.UTC()) {
 		r.cnames.Insert(sub)
-		return false
+		return true
 	} else if times > 1 && r.cnames.Has(sub) {
-		return false
-	} else if times > r.enum.Config.MinForRecursive {
 		return true
 	}
 
 	subreq := &requests.SubdomainRequest{
 		Name:   sub,
 		Domain: req.Domain,
-		Tag:    req.Tag,
-		Source: req.Source,
 		Times:  times,
 	}
 
-	r.queue.Append(subreq)
+	r.enum.sendRequests(subreq)
 	if times == 1 {
+		r.possibleApexes[sub] = struct{}{}
 		pipeline.SendData(ctx, "root", subreq, tp)
 	}
 	return true
 }
 
 func (r *subdomainTask) subWithinWildcard(ctx context.Context, name, domain string) bool {
-	for _, t := range InitialQueryTypes {
+	for _, t := range FwdQueryTypes {
 		select {
 		case <-ctx.Done():
 			return false
 		default:
 		}
 
-		msg := resolve.QueryMsg("a."+name, t)
-		resp, err := r.enum.Sys.Pool().Query(ctx, msg, resolve.PriorityHigh, resolve.PoolRetryPolicy)
-		if err == nil && resp != nil && len(resp.Answer) > 0 &&
-			r.enum.Sys.Pool().WildcardType(ctx, resp, domain) != resolve.WildcardTypeNone {
+		if resp, err := r.enum.fwdQuery(ctx, "a."+name, t); err == nil &&
+			len(resp.Answer) > 0 && r.enum.Sys.TrustedResolvers().WildcardDetected(ctx, resp, domain) {
 			return true
 		}
 	}
 	return false
-}
-
-// OutputRequests sends discovered subdomain names to the enumeration data sources.
-func (r *subdomainTask) OutputRequests(num int) int {
-	var count int
-
-	if num <= 0 {
-		return count
-	}
-loop:
-	for ; count < num; count++ {
-		select {
-		case <-r.done:
-			break loop
-		default:
-		}
-
-		element, ok := r.queue.Next()
-		if !ok {
-			break loop
-		}
-
-		for _, src := range r.enum.srcs {
-			switch v := element.(type) {
-			case *requests.ResolvedRequest:
-				src.Request(r.enum.ctx, v)
-				if r.enum.Config.Alterations && src.String() == "Alterations" {
-					count += len(r.enum.Config.AltWordlist)
-				}
-				if r.enum.Config.BruteForcing && src.String() == "Brute Forcing" && r.enum.Config.MinForRecursive == 0 {
-					count += len(r.enum.Config.Wordlist)
-				}
-			case *requests.SubdomainRequest:
-				src.Request(r.enum.ctx, v)
-				if r.enum.Config.BruteForcing && src.String() == "Brute Forcing" && v.Times >= r.enum.Config.MinForRecursive {
-					count += len(r.enum.Config.Wordlist)
-				}
-			}
-		}
-	}
-	return count
 }
 
 func (r *subdomainTask) timesForSubdomain(sub string) int {
@@ -219,6 +172,49 @@ func (r *subdomainTask) timesManager() {
 
 			subdomains[req.Sub] = times
 			req.Ch <- times
+		}
+	}
+}
+
+func (r *subdomainTask) linkNodesToApexes() {
+	apexes := make(map[string]*types.Asset)
+
+	for k := range r.possibleApexes {
+		res, err := r.enum.graph.DB.FindByContent(domain.FQDN{Name: k}, r.enum.Config.CollectionStartTime)
+		if err != nil || len(res) == 0 {
+			continue
+		}
+		apex := res[0]
+
+		if rels, err := r.enum.graph.DB.OutgoingRelations(apex, r.enum.Config.CollectionStartTime, "ns_record"); err == nil && len(rels) > 0 {
+			apexes[k] = apex
+		}
+	}
+
+	for _, d := range r.enum.Config.Domains() {
+		names, err := r.enum.graph.DB.FindByScope([]oam.Asset{domain.FQDN{Name: d}}, r.enum.Config.CollectionStartTime)
+		if err != nil || len(names) == 0 {
+			continue
+		}
+
+		for _, name := range names {
+			n, ok := name.Asset.(domain.FQDN)
+			if !ok {
+				continue
+			}
+			// determine which domain apex this name is a node in
+			best := len(n.Name)
+			var apex *types.Asset
+			for fqdn, a := range apexes {
+				if idx := strings.Index(n.Name, fqdn); idx != -1 && idx != 0 && idx < best {
+					best = idx
+					apex = a
+				}
+			}
+
+			if apex != nil {
+				_, _ = r.enum.graph.DB.Create(apex, "node", n)
+			}
 		}
 	}
 }

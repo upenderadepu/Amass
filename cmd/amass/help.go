@@ -1,3 +1,7 @@
+// Copyright © by Jeff Foley 2017-2023. All rights reserved.
+// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -15,18 +19,10 @@ func runHelpCommand(clArgs []string) {
 		return
 	}
 	switch clArgs[0] {
-	case "db":
-		runDBCommand(help)
-	case "dns":
-		runDNSCommand(help)
 	case "enum":
 		runEnumCommand(help)
 	case "intel":
 		runIntelCommand(help)
-	case "track":
-		runTrackCommand(help)
-	case "viz":
-		runVizCommand(help)
 	default:
 		commandUsage(mainUsageMsg, helpCommand, helpBuf)
 		return
